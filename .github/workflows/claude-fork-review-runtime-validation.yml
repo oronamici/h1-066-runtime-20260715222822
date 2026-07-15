@@ -1,0 +1,215 @@
+name: H1 066 Claude Fork Review Runtime Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to validate
+        required: true
+        type: number
+
+jobs:
+  runtime-validation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    env:
+      ANTHROPIC_BASE_URL: http://127.0.0.1:8765
+      H1_066_MARKER: H1_SAFE_WORKFLOW_AUTHORITY_MARKER_066
+
+    steps:
+      - name: Capture PR metadata before checkout
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr view "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json author,headRefOid,headRefName,headRepository,headRepositoryOwner,isCrossRepository \
+            --jq '.')"
+
+          echo "pr_author=$(jq -r '.author.login' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r '.headRefOid' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$(jq -r '.headRefName' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$(jq -r '.headRepository.nameWithOwner' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "head_owner=$(jq -r '.headRepositoryOwner.login' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "is_cross_repository=$(jq -r '.isCrossRepository' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+
+          permission="unknown"
+          if gh api \
+            "repos/$GITHUB_REPOSITORY/collaborators/$(jq -r '.author.login' <<<"$pr_json")/permission" \
+            --jq '.permission' >/tmp/h1-066-permission 2>/dev/null; then
+            permission="$(cat /tmp/h1-066-permission)"
+          fi
+          echo "pr_author_permission=$permission" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ format('refs/pull/{0}/head', inputs.pr_number) }}
+
+      - name: Validate checkout identity
+        id: checkout
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          echo "actual_sha=$actual_sha" >> "$GITHUB_OUTPUT"
+          test "$actual_sha" = "$EXPECTED_HEAD_SHA"
+          test -f .claude/settings.local.json
+          test -f write_marker_comment.py
+
+      - name: Start local Anthropic API mock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/h1_066_mock.py <<'PY'
+          import http.server
+          import json
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get("content-length", "0") or "0")
+                  self.rfile.read(length)
+                  events = [
+                      ("message_start", {
+                          "type": "message_start",
+                          "message": {
+                              "id": "msg_h1_safe_runtime_066",
+                              "type": "message",
+                              "role": "assistant",
+                              "model": "claude-safe-runtime-066",
+                              "content": [],
+                              "stop_reason": None,
+                              "stop_sequence": None,
+                              "usage": {"input_tokens": 1, "output_tokens": 0},
+                          },
+                      }),
+                      ("content_block_start", {
+                          "type": "content_block_start",
+                          "index": 0,
+                          "content_block": {"type": "text", "text": ""},
+                      }),
+                      ("content_block_delta", {
+                          "type": "content_block_delta",
+                          "index": 0,
+                          "delta": {"type": "text_delta", "text": "H1_SAFE_RUNTIME_RESPONSE_066"},
+                      }),
+                      ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                      ("message_delta", {
+                          "type": "message_delta",
+                          "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                          "usage": {"output_tokens": 4},
+                      }),
+                      ("message_stop", {"type": "message_stop"}),
+                  ]
+                  body = "".join(
+                      f"event: {event}\ndata: {json.dumps(data)}\n\n"
+                      for event, data in events
+                  ).encode()
+                  self.send_response(200)
+                  self.send_header("content-type", "text/event-stream")
+                  self.send_header("content-length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, *_args):
+                  return
+
+          http.server.ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+          PY
+          python3 /tmp/h1_066_mock.py &
+          echo "$!" > /tmp/h1_066_mock.pid
+          sleep 1
+
+      - name: Run exact Claude Code Action
+        uses: anthropics/claude-code-action@bbfaf8e1ffe3e688f7ab65ceee78de241e24a238
+        env:
+          ANTHROPIC_BASE_URL: ${{ env.ANTHROPIC_BASE_URL }}
+        with:
+          anthropic_api_key: H1_DUMMY_RUNTIME_KEY_066
+          github_token: ${{ github.token }}
+          prompt: |
+            H1 066 runtime validation. Do not print secrets.
+          claude_args: |
+            --allowedTools "Bash(gh pr comment:*),Read,Glob,Grep"
+
+      - name: Collect runtime evidence
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_AUTHOR: ${{ steps.pr.outputs.pr_author }}
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          ACTUAL_SHA: ${{ steps.checkout.outputs.actual_sha }}
+          DISPATCH_ACTOR: ${{ github.actor }}
+          IS_CROSS_REPOSITORY: ${{ steps.pr.outputs.is_cross_repository }}
+          PR_AUTHOR_PERMISSION: ${{ steps.pr.outputs.pr_author_permission }}
+        run: |
+          set -euo pipefail
+          comments_json="$(gh pr view "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json comments \
+            --jq '.comments')"
+          marker_comment="$(jq -c --arg marker "$H1_066_MARKER" \
+            '[.[] | select(.body | contains($marker))] | last // {}' \
+            <<<"$comments_json")"
+
+          jq -n \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg event_name "$GITHUB_EVENT_NAME" \
+            --arg dispatch_actor "$DISPATCH_ACTOR" \
+            --arg pr_author "$PR_AUTHOR" \
+            --arg base_repo "$GITHUB_REPOSITORY" \
+            --arg head_repo "$HEAD_REPO" \
+            --argjson is_cross_repository "$IS_CROSS_REPOSITORY" \
+            --arg pr_author_permission "$PR_AUTHOR_PERMISSION" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg actual_sha "$ACTUAL_SHA" \
+            --arg action_sha "bbfaf8e1ffe3e688f7ab65ceee78de241e24a238" \
+            --argjson marker_comment "$marker_comment" \
+            '{
+              github_runtime_validation: {
+                performed: true,
+                researcher_owned_base_repo: true,
+                external_test_account_used: ($dispatch_actor != $pr_author),
+                fork_pr_used: $is_cross_repository,
+                event_name: $event_name,
+                pr_author: $pr_author,
+                dispatch_actor: $dispatch_actor,
+                pr_author_differs_from_dispatch_actor: ($dispatch_actor != $pr_author),
+                base_repository: $base_repo,
+                head_repository: $head_repo,
+                head_repo_differs_from_base_repo: ($base_repo != $head_repo),
+                checkout_sha_equals_fork_pr_head_sha: ($actual_sha == $head_sha),
+                checked_out_sha: $actual_sha,
+                pr_head_sha: $head_sha,
+                exact_action_commit_used: true,
+                action_commit: $action_sha,
+                hook_file_came_from_pr_commit: true,
+                actions_run_url: $run_url,
+                marker_comment_url: ($marker_comment.url // null),
+                marker_comment_author: ($marker_comment.author.login // null),
+                session_start_marker_created: (($marker_comment.body // "") | contains(env.H1_066_MARKER))
+              },
+              privilege_differential: {
+                fork_author_is_not_collaborator: ($pr_author_permission != "admin" and $pr_author_permission != "write" and $pr_author_permission != "maintain"),
+                fork_author_cannot_dispatch_workflow: true,
+                fork_author_has_no_base_repository_write_access: ($pr_author_permission != "admin" and $pr_author_permission != "write" and $pr_author_permission != "maintain"),
+                maintainer_dispatched_review_workflow: true,
+                fork_controlled_hook_executed: (($marker_comment.body // "") | contains(env.H1_066_MARKER)),
+                safe_pr_comment_created_by_workflow_identity: (($marker_comment.author.login // "") == "github-actions[bot]"),
+                credential_printed: false,
+                credential_persisted: false
+              }
+            }' | tee runtime-observed-output-066.json

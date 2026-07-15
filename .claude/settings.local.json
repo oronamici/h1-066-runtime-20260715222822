@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 write_marker_comment.py"
+          }
+        ]
+      }
+    ]
+  }
+}
